@@ -3,13 +3,14 @@
            #-}
 module Main where
 
-import GHC
+import GHC (runGhc)
 import DynFlags
 import GHC.Paths ( libdir )
 
 import Control.Monad.IO.Class
 import Control.Monad
 import Data.Maybe
+import Data.List
 import Data.Either.Combinators
 import Test.HUnit hiding (test)
 import System.IO
@@ -30,10 +31,12 @@ import Language.Haskell.Tools.Refactor.GenerateExports
 import Language.Haskell.Tools.Refactor.RenameDefinition
 import Language.Haskell.Tools.Refactor.ExtractBinding
 import Language.Haskell.Tools.Refactor.RefactorBase
+import Language.Haskell.Tools.Refactor.ASTDebug
 
-main = run unitTests
+main :: IO ()
+main = run nightlyTests
 
-run :: [Test] -> IO Counts
+run :: [Test] -> IO ()
 run tests = do results <- runTestTT $ TestList tests
                if errors results + failures results > 0 
                   then exitFailure
@@ -53,6 +56,8 @@ unitTests = map makeReprintTest checkTestCases
               ++ map makeWrongRenameDefinitionTest wrongRenameDefinitionTests
               ++ map makeExtractBindingTest extractBindingTests
               ++ map makeWrongExtractBindingTest wrongExtractBindingTests
+              ++ map makeMultiModuleTest multiModuleTests
+              ++ map makeASTDebugTest astDebugTests
   where checkTestCases = languageTests 
                           ++ organizeImportTests 
                           ++ map fst generateSignatureTests 
@@ -106,7 +111,9 @@ languageTests =
   , "Expr.Case"
   , "Expr.DoNotation"
   , "Expr.GeneralizedListComp"
+  , "Expr.EmptyCase"
   , "Expr.If"
+  , "Expr.ImplicitParams"
   , "Expr.LambdaCase"
   , "Expr.ListComp"
   , "Expr.MultiwayIf"
@@ -127,6 +134,7 @@ languageTests =
   , "Module.Import"
   , "Pattern.Backtick"
   , "Pattern.Constructor"
+  , "Pattern.ImplicitParams"
   , "Pattern.Infix"
   , "Pattern.NPlusK"
   , "Pattern.Record"
@@ -139,6 +147,11 @@ languageTests =
   , "Type.TypeOperators"
   , "Type.Unpack"
   , "Type.Wildcard"
+  , "TH.Brackets"
+  , "TH.QuasiQuote.Define"
+  , "TH.QuasiQuote.Use"
+  , "TH.Splice.Define"
+  , "TH.Splice.Use"
   , "Refactor.CommentHandling.CommentTypes"
   , "Refactor.CommentHandling.BlockComments"
   , "Refactor.CommentHandling.Crosslinking"
@@ -207,6 +220,7 @@ renameDefinitionTests =
   , ("Refactor.RenameDefinition.QualName", "3:1-3:2", "q")
   , ("Refactor.RenameDefinition.BacktickName", "3:1-3:2", "g")
   , ("Refactor.RenameDefinition.ParenName", "4:3-4:5", "<->")
+  , ("Refactor.RenameDefinition.RecordWildcards", "4:32-4:33", "yy")
   , ("Refactor.RenameDefinition.RecordPatternSynonyms", "4:16-4:17", "xx")
   , ("Refactor.RenameDefinition.ClassMember", "7:3-7:4", "q")
   , ("Refactor.RenameDefinition.LocalFunction", "4:5-4:6", "g")
@@ -218,6 +232,11 @@ renameDefinitionTests =
   , ("Refactor.RenameDefinition.TypeOperators", "4:13-4:15", "x1")
   , ("Refactor.RenameDefinition.NoPrelude", "4:1-4:2", "map")
   , ("Refactor.RenameDefinition.UnusedDef", "3:1-3:2", "map")
+  , ("Refactor.RenameDefinition.ImplicitParams", "8:17-8:20", "compare")
+  , ("Refactor.RenameDefinition.SameCtorAndType", "3:6-3:13", "P2D")
+  , ("Refactor.RenameDefinition.RoleAnnotation", "4:11-4:12", "AA")
+  , ("Refactor.RenameDefinition.TypeBracket", "6:6-6:7", "B")
+  , ("Refactor.RenameDefinition.ValBracket", "8:11-8:12", "B")
   ]
 
 wrongRenameDefinitionTests =
@@ -250,58 +269,101 @@ wrongExtractBindingTests =
   [ ("Refactor.ExtractBinding.TooSimple", "3:19-3:20", "x")
   , ("Refactor.ExtractBinding.NameConflict", "3:19-3:27", "stms")
   ]
+
+multiModuleTests =
+  [ ("RenameDefinition 5:5-5:6 bb", "A", "Refactor/RenameDefinition/MultiModule", [])
+  , ("RenameDefinition 1:8-1:9 C", "B", "Refactor/RenameDefinition/RenameModule", ["B"])
+  , ("RenameDefinition 3:8-3:9 C", "A", "Refactor/RenameDefinition/RenameModule", ["B"])
+  , ("RenameDefinition 6:1-6:9 hello", "Use", "Refactor/RenameDefinition/SpliceDecls", [])
+  , ("RenameDefinition 5:1-5:5 exprSplice", "Define", "Refactor/RenameDefinition/SpliceExpr", [])
+  , ("RenameDefinition 6:1-6:4 spliceTyp", "Define", "Refactor/RenameDefinition/SpliceType", [])
+  ]
+
+astDebugTests =
+  [ ("ASTDebug.Name", (\case NameInfoType {} -> True; _ -> False))
+  , ("ASTDebug.Name", (\case ExprInfoType {} -> True; _ -> False))
+  , ("ASTDebug.Expr", (\case ExprInfoType {} -> True; _ -> False))
+  , ("ASTDebug.Simple", (\case ModuleInfoType {} -> True; _ -> False))
+  , ("ASTDebug.Import", (\case ImportInfoType {} -> True; _ -> False))
+  , ("ASTDebug.ImplicitFldCreate", (\case ImplicitFieldInfoType {} -> True; _ -> False))
+  , ("ASTDebug.ImplicitFldExtract", (\case ImplicitFieldInfoType {} -> True; _ -> False))
+  ]
    
+makeASTDebugTest :: (String, SemanticInfoType IdDom -> Bool) -> Test
+makeASTDebugTest (mod, check)
+  = TestLabel mod $ TestCase $ 
+      do modul <- runGhc (Just libdir) (parseTyped =<< loadModule rootDir mod)
+         let semaInfos = concatMap flattenDebugNode (astDebug' modul)
+         assertBool "The searched semantic element is not found" (any check semaInfos)
+
+flattenDebugNode :: DebugNode dom -> [SemanticInfoType dom]
+flattenDebugNode (TreeNode _ (TreeDebugNode _ sema more)) = sema : concatMap flattenDebugNode more
+flattenDebugNode _ = []
+
+makeMultiModuleTest :: (String, String, String, [String]) -> Test
+makeMultiModuleTest (refact, mod, root, removed)
+  = TestLabel (root ++ ":" ++ mod) $ TestCase 
+      $ do res <- performRefactors refact (rootDir </> root) [] mod
+           case res of Right result -> checkResults result removed
+                       Left err -> assertFailure $ "The transformation failed : " ++ err
+  where checkResults :: [(String, Maybe String)] -> [String] -> IO ()
+        checkResults ((name, Just mod):rest) removed = 
+          do expected <- loadExpected False ((rootDir </> root) ++ "_res") name
+             assertEqual "The transformed result is not what is expected" (standardizeLineEndings expected)
+                                                                          (standardizeLineEndings mod)
+             checkResults rest removed
+        checkResults ((name, Nothing) : rest) removed = checkResults rest (delete name removed)
+        checkResults [] [] = return ()
+        checkResults [] removed = assertFailure $ "Modules has not been marked as removed: " ++ concat (intersperse ", " removed)
+
+createTest :: String -> [String] -> String -> Test
+createTest refactoring args mod
+  = TestLabel mod $ TestCase $ checkCorrectlyTransformed (refactoring ++ (concatMap (" "++) args)) rootDir mod
+
+createFailTest :: String -> [String] -> String -> Test
+createFailTest refactoring args mod
+  = TestLabel mod $ TestCase $ checkTransformFails (refactoring ++ (concatMap (" "++) args)) rootDir mod
+
 makeOrganizeImportsTest :: String -> Test
-makeOrganizeImportsTest mod 
-  = TestLabel mod $ TestCase $ checkCorrectlyTransformed organizeImports rootDir mod
+makeOrganizeImportsTest = createTest "OrganizeImports" []
 
 makeGenerateSignatureTest :: (String, String) -> Test
-makeGenerateSignatureTest (mod, readSrcSpan (toFileName mod) -> rng) 
-  = TestLabel mod $ TestCase $ checkCorrectlyTransformed (generateTypeSignature' rng) rootDir mod
+makeGenerateSignatureTest (mod, rng) = createTest "GenerateSignature" [rng] mod
 
 makeGenerateExportsTest :: String -> Test
-makeGenerateExportsTest mod 
-  = TestLabel mod $ TestCase $ checkCorrectlyTransformed generateExports rootDir mod
+makeGenerateExportsTest mod = createTest "GenerateExports" [] mod
 
 makeRenameDefinitionTest :: (String, String, String) -> Test
-makeRenameDefinitionTest (mod, readSrcSpan (toFileName mod) -> rng, newName) 
-  = TestLabel mod $ TestCase $ checkCorrectlyTransformed (renameDefinition' rng newName) rootDir mod
-
+makeRenameDefinitionTest (mod, rng, newName) = createTest "RenameDefinition" [rng, newName] mod
 
 makeWrongRenameDefinitionTest :: (String, String, String) -> Test
-makeWrongRenameDefinitionTest (mod, readSrcSpan (toFileName mod) -> rng, newName) 
-  = TestLabel mod $ TestCase $ checkTransformFails (renameDefinition' rng newName) rootDir mod
+makeWrongRenameDefinitionTest (mod, rng, newName) = createFailTest "RenameDefinition" [rng, newName] mod
 
 makeExtractBindingTest :: (String, String, String) -> Test
-makeExtractBindingTest (mod, readSrcSpan (toFileName mod) -> rng, newName) 
-  = TestLabel mod $ TestCase $ checkCorrectlyTransformed (extractBinding' rng newName) rootDir mod
+makeExtractBindingTest (mod, rng, newName) = createTest "ExtractBinding" [rng, newName] mod
   
 makeWrongExtractBindingTest :: (String, String, String) -> Test
-makeWrongExtractBindingTest (mod, readSrcSpan (toFileName mod) -> rng, newName) 
-  = TestLabel mod $ TestCase $ checkTransformFails (extractBinding' rng newName) rootDir mod
+makeWrongExtractBindingTest (mod, rng, newName) = createFailTest "ExtractBinding" [rng, newName] mod
 
-checkCorrectlyTransformed :: (Ann AST.Module TemplateWithTypes -> Refactor GHC.Id (Ann AST.Module TemplateWithTypes)) -> String -> String -> IO ()
-checkCorrectlyTransformed transform workingDir moduleName
-  = do -- need to use binary or line endings will be translated
-       expectedHandle <- openBinaryFile (workingDir </> map (\case '.' -> pathSeparator; c -> c) moduleName ++ "_res.hs") ReadMode
-       expected <- hGetContents expectedHandle
-       transformed <- runGhc (Just libdir) ((\mod -> mapBoth id prettyPrint <$> (runRefactor mod transform))
-                                              =<< parseTyped 
-                                              =<< parse workingDir moduleName)
+checkCorrectlyTransformed :: String -> String -> String -> IO ()
+checkCorrectlyTransformed command workingDir moduleName
+  = do expected <- loadExpected True workingDir moduleName
+       res <- performRefactor command workingDir [] moduleName
        assertEqual "The transformed result is not what is expected" (Right (standardizeLineEndings expected)) 
-                                                                    (mapRight standardizeLineEndings transformed)
+                                                                    (mapRight standardizeLineEndings res)
+
+checkTransformFails :: String -> String -> String -> IO ()
+checkTransformFails command workingDir moduleName
+  = do res <- performRefactor command workingDir [] moduleName
+       assertBool "The transform should fail for the given input" (isLeft res)
        
-checkTransformFails :: (Ann AST.Module TemplateWithTypes -> Refactor GHC.Id (Ann AST.Module TemplateWithTypes)) -> String -> String -> IO ()
-checkTransformFails transform workingDir moduleName
-  = do -- need to use binary or line endings will be translated
-       transformed <- runGhc (Just libdir) ((\mod -> mapBoth id prettyPrint <$> (runRefactor mod transform))
-                                              =<< parseTyped 
-                                              =<< parse workingDir moduleName)
-       assertBool "The transform should fail for the given input" (isLeft transformed)
+loadExpected :: Bool -> String -> String -> IO String
+loadExpected resSuffix workingDir moduleName = 
+  do -- need to use binary or line endings will be translated
+     expectedHandle <- openBinaryFile (workingDir </> map (\case '.' -> pathSeparator; c -> c) moduleName ++ (if resSuffix then "_res" else "") ++ ".hs") ReadMode
+     hGetContents expectedHandle
 
 standardizeLineEndings = filter (/= '\r')
-       
-toFileName mod = rootDir </> map (\case '.' -> pathSeparator; c -> c) mod ++ ".hs"
        
 makeReprintTest :: String -> Test       
 makeReprintTest mod = TestLabel mod $ TestCase (checkCorrectlyPrinted rootDir mod)
@@ -318,7 +380,7 @@ checkCorrectlyPrinted workingDir moduleName
        expectedHandle <- openBinaryFile (workingDir </> map (\case '.' -> pathSeparator; c -> c) moduleName ++ ".hs") ReadMode
        expected <- hGetContents expectedHandle
        (actual, actual', actual'') <- runGhc (Just libdir) $ do
-         parsed <- parse workingDir moduleName
+         parsed <- loadModule workingDir moduleName
          actual <- prettyPrint <$> parseAST parsed
          actual' <- prettyPrint <$> parseRenamed parsed
          actual'' <- prettyPrint <$> parseTyped parsed
@@ -327,26 +389,3 @@ checkCorrectlyPrinted workingDir moduleName
        assertEqual "The original and the transformed source differ" expected actual'
        assertEqual "The original and the transformed source differ" expected actual''
               
-parseAST :: ModSummary -> Ghc (Ann AST.Module (NodeInfo (SemanticInfo RdrName) SourceTemplate))
-parseAST modSum = do
-  p <- parseModule modSum
-  let annots = pm_annotations p
-      srcBuffer = fromJust $ ms_hspp_buf $ pm_mod_summary p
-  rangeToSource srcBuffer . cutUpRanges . fixRanges . placeComments (snd annots) 
-     <$> (runTrf (fst annots) (getPragmaComments $ snd annots) $ trfModule $ pm_parsed_source p)
-                                 
-parse :: String -> String -> Ghc ModSummary
-parse workingDir moduleName = do
-  dflags <- getSessionDynFlags
-  -- don't generate any code
-  setSessionDynFlags $ gopt_set (dflags { importPaths = [workingDir]
-                                        , hscTarget = HscAsm -- needed for static pointers
-                                        , ghcLink = LinkInMemory
-                                        , ghcMode = CompManager 
-                                        }) Opt_KeepRawTokenStream
-  target <- guessTarget moduleName Nothing
-  setTargets [target]
-  load LoadAllTargets
-  getModSummary $ mkModuleName moduleName
-                            
-           

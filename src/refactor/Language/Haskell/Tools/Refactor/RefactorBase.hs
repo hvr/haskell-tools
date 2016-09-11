@@ -3,10 +3,13 @@
            , ViewPatterns
            , StandaloneDeriving
            , LambdaCase
+           , FlexibleInstances
+           , FlexibleContexts
+           , TypeSynonymInstances
            #-}
 module Language.Haskell.Tools.Refactor.RefactorBase where
 
-import Language.Haskell.Tools.AST
+import Language.Haskell.Tools.AST as AST
 import Language.Haskell.Tools.AST.Gen
 import Language.Haskell.Tools.AnnTrf.SourceTemplateHelpers
 import Language.Haskell.Tools.AnnTrf.SourceTemplate
@@ -21,32 +24,59 @@ import qualified TysWiredIn as GHC
 import Control.Reference hiding (element)
 import Data.Function (on)
 import Data.List
+import Data.List.Split
 import Data.Maybe
 import Data.Char
 import Control.Monad.Reader
 import Control.Monad.Trans.Except
 import Control.Monad.Writer
+import Control.Monad.State
 
--- | The information a refactoring can use
-data RefactorCtx a = RefactorCtx { refModuleName :: GHC.Module
-                                 , refCtxImports :: [Ann ImportDecl a] 
-                                 }
+type UnnamedModule dom = Ann AST.Module dom SrcTemplateStage
+
+-- | The name of the module and the AST
+type ModuleDom dom = (String, UnnamedModule dom)
+
+-- | A refactoring that only affects one module
+type LocalRefactoring dom = UnnamedModule dom -> LocalRefactor dom (UnnamedModule dom)
+
+-- | The type of a refactoring
+type Refactoring dom = ModuleDom dom -> [ModuleDom dom] -> Refactor [RefactorChange dom]
+
+
+data RefactorChange dom = ContentChanged (ModuleDom dom)
+                        | ModuleRemoved String
 
 -- | Performs the given refactoring, transforming it into a Ghc action
-runRefactor :: (a ~ STWithNames n, TemplateAnnot a) => Ann Module a -> (Ann Module a -> Refactor n (Ann Module a)) -> Ghc (Either String (Ann Module a))
-runRefactor mod trf = let init = RefactorCtx (fromJust $ mod ^? semantics&defModuleName) (mod ^? element&modImports&annList)
-                       in runExceptT $ runReaderT (addGeneratedImports (runWriterT (fromRefactorT $ trf mod))) init
+runRefactor :: (SemanticInfo' dom SameInfoModuleCls ~ ModuleInfo n) 
+            => ModuleDom dom -> [ModuleDom dom] -> Refactoring dom -> Ghc (Either String [RefactorChange dom])
+runRefactor mod mods trf = runExceptT $ trf mod mods
+
+-- | Wraps a refactoring that only affects one module. Performs the per-module finishing touches.
+localRefactoring :: HasModuleInfo (SemanticInfo dom Module) => LocalRefactoring dom -> Refactoring dom
+localRefactoring ref (name, mod) _ 
+  = (\m -> [ContentChanged (name, m)]) <$> localRefactoringRes id mod (ref mod)
+
+-- | Transform the result of the local refactoring
+localRefactoringRes :: HasModuleInfo (SemanticInfo dom Module)
+                    => ((UnnamedModule dom -> UnnamedModule dom) -> a -> a) 
+                          -> UnnamedModule dom 
+                          -> LocalRefactor dom a
+                          -> Refactor a
+localRefactoringRes access mod trf
+  = let init = RefactorCtx (semanticsModule $ mod ^. semantics) (mod ^? element&modImports&annList)
+     in flip runReaderT init $ do (mod, newNames) <- runWriterT (fromRefactorT trf)
+                                  return $ access (addGeneratedImports newNames) mod
 
 -- | Adds the imports that bring names into scope that are needed by the refactoring
-addGeneratedImports :: (TemplateAnnot a, Monad m) => ReaderT (RefactorCtx a) m (Ann Module a, [GHC.Name]) -> ReaderT (RefactorCtx a) m (Ann Module a)
-addGeneratedImports = 
-  fmap (\(m,names) -> element&modImports&annListElems .- (++ addImports names) $ m)
-  where addImports :: TemplateAnnot a => [GHC.Name] -> [Ann ImportDecl a]
+addGeneratedImports :: [GHC.Name] -> Ann Module dom SrcTemplateStage -> Ann Module dom SrcTemplateStage
+addGeneratedImports names m = element&modImports&annListElems .- (++ addImports names) $ m
+  where addImports :: [GHC.Name] -> [Ann ImportDecl dom SrcTemplateStage]
         addImports names = map createImport $ groupBy ((==) `on` GHC.nameModule) $ nub $ sort names
 
         -- TODO: group names like constructors into correct IESpecs
-        createImport :: TemplateAnnot a => [GHC.Name] -> Ann ImportDecl a
-        createImport names = mkImportDecl False False False Nothing (mkSimpleName $ GHC.moduleNameString $ GHC.moduleName $ GHC.nameModule $ head names)
+        createImport :: [GHC.Name] -> Ann ImportDecl dom SrcTemplateStage
+        createImport names = mkImportDecl False False False Nothing (mkModuleName $ GHC.moduleNameString $ GHC.moduleName $ GHC.nameModule $ head names)
                                           Nothing (Just $ mkImportSpecList (map (\n -> mkIeSpec (mkUnqualName' n) Nothing) names))
 
 instance (GhcMonad m, Monoid s) => GhcMonad (WriterT s m) where
@@ -75,21 +105,39 @@ instance ExceptionMonad m => ExceptionMonad (ExceptT s m) where
   
 
 -- | Input and output information for the refactoring
-newtype RefactorT ann m ast = RefactorT { fromRefactorT :: WriterT [GHC.Name] (ReaderT (RefactorCtx ann) m) ast }
-  deriving (Functor, Applicative, Monad, MonadReader (RefactorCtx ann), MonadWriter [GHC.Name], MonadIO, HasDynFlags, ExceptionMonad, GhcMonad)
+newtype LocalRefactorT dom m a = LocalRefactorT { fromRefactorT :: WriterT [GHC.Name] (ReaderT (RefactorCtx dom) m) a }
+  deriving (Functor, Applicative, Monad, MonadReader (RefactorCtx dom), MonadWriter [GHC.Name], MonadIO, HasDynFlags, ExceptionMonad, GhcMonad)
 
-instance MonadTrans (RefactorT ann) where
-  lift = RefactorT . lift . lift
+-- | The information a refactoring can use
+data RefactorCtx dom = RefactorCtx { refModuleName :: GHC.Module
+                                   , refCtxImports :: [Ann ImportDecl dom SrcTemplateStage] 
+                                   }
 
-refactError :: String -> Refactor n a
-refactError = lift . throwE
+instance MonadTrans (LocalRefactorT dom) where
+  lift = LocalRefactorT . lift . lift
 
--- | The refactoring monad
-type Refactor n = RefactorT (STWithNames n) (ExceptT String Ghc)
+-- | A monad that can be used to refactor
+class Monad m => RefactorMonad m where
+  refactError :: String -> m a
+  liftGhc :: Ghc a -> m a
 
-type STWithNames n = NodeInfo (SemanticInfo n) SourceTemplate
+instance RefactorMonad Refactor where
+  refactError = throwE
+  liftGhc = lift
 
-type RefactoredModule n = Refactor n (Ann Module (STWithNames n))
+instance RefactorMonad (LocalRefactor dom) where
+  refactError = lift . refactError
+  liftGhc = lift . liftGhc
+
+instance RefactorMonad m => RefactorMonad (StateT s m) where
+  refactError = lift . refactError
+  liftGhc = lift . liftGhc
+
+-- | The refactoring monad for a given module
+type LocalRefactor dom = LocalRefactorT dom Refactor
+
+-- | The refactoring monad for the whole project
+type Refactor = ExceptT String Ghc
 
 registeredNamesFromPrelude :: [GHC.Name]
 registeredNamesFromPrelude = GHC.basicKnownKeyNames ++ map GHC.tyConName GHC.wiredInTyCons
@@ -105,14 +153,17 @@ qualifiedName name = case GHC.nameModule_maybe name of
   Just mod -> GHC.moduleNameString (GHC.moduleName mod) ++ "." ++ GHC.occNameString (GHC.nameOccName name)
   Nothing -> GHC.occNameString (GHC.nameOccName name)
 
-referenceName :: (Eq n, GHC.NamedThing n) => n -> Refactor n (Ann Name (STWithNames n))
+referenceName :: (SemanticInfo' dom SameInfoImportCls ~ ImportInfo n, Eq n, GHC.NamedThing n) 
+              => n -> LocalRefactor dom (Ann Name dom SrcTemplateStage)
 referenceName = referenceName' mkQualName'
 
-referenceOperator :: (Eq n, GHC.NamedThing n) => n -> Refactor n (Ann Operator (STWithNames n))
+referenceOperator :: (SemanticInfo' dom SameInfoImportCls ~ ImportInfo n, Eq n, GHC.NamedThing n) 
+                  => n -> LocalRefactor dom (Ann Operator dom SrcTemplateStage)
 referenceOperator = referenceName' mkQualOp'
 
 -- | Create a name that references the definition. Generates an import if the definition is not yet imported.
-referenceName' :: (Eq n, GHC.NamedThing n) => ([String] -> GHC.Name -> Ann nt (STWithNames n)) -> n -> Refactor n (Ann nt (STWithNames n))
+referenceName' :: (SemanticInfo' dom SameInfoImportCls ~ ImportInfo n, Eq n, GHC.NamedThing n) 
+               => ([String] -> GHC.Name -> Ann nt dom SrcTemplateStage) -> n -> LocalRefactor dom (Ann nt dom SrcTemplateStage)
 referenceName' makeName n@(GHC.getName -> name) 
   | name `elem` registeredNamesFromPrelude || qualifiedName name `elem` otherNamesFromPrelude
   = return $ makeName [] name -- imported from prelude
@@ -127,16 +178,16 @@ referenceName' makeName n@(GHC.getName -> name)
                     else return $ referenceBy makeName name possibleImports -- use it according to the best available import
 
 -- | Reference the name by the shortest suitable import
-referenceBy :: (TemplateAnnot a) => ([String] -> GHC.Name -> Ann nt a) -> GHC.Name -> [Ann ImportDecl a] -> Ann nt a
+referenceBy :: ([String] -> GHC.Name -> Ann nt dom SrcTemplateStage) -> GHC.Name -> [Ann ImportDecl dom SrcTemplateStage] -> Ann nt dom SrcTemplateStage
 referenceBy makeName name imps = 
   let prefixes = map importQualifier imps
    in makeName (minimumBy (compare `on` (length . concat)) prefixes) name
-  where importQualifier :: Ann ImportDecl a -> [String]
+  where importQualifier :: Ann ImportDecl dom SrcTemplateStage -> [String]
         importQualifier imp 
           = if isJust (imp ^? element&importQualified&annJust) 
               then case imp ^? element&importAs&annJust&element&importRename&element of 
-                      Nothing -> nameElements (imp ^. element&importModule&element) -- fully qualified import
-                      Just asName -> nameElements asName -- the name given by as clause
+                      Nothing -> splitOn "." (imp ^. element&importModule&element&moduleNameString) -- fully qualified import
+                      Just asName -> splitOn "." (asName ^. moduleNameString) -- the name given by as clause
               else [] -- unqualified import
 
 -- | Different classes of definitions that have different kind of names.
@@ -147,8 +198,8 @@ data NameClass = Variable         -- ^ Normal value definitions: functions, vari
                | SynonymOperator  -- ^ Type definitions with operator-like names
 
 -- | Get which category does a given name belong to
-classifyName :: GHC.Name -> Refactor n NameClass
-classifyName n = lookupName n >>= return . \case 
+classifyName :: RefactorMonad m => GHC.Name -> m NameClass
+classifyName n = liftGhc (lookupName n) >>= return . \case 
     Just (AnId id) | isop     -> ValueOperator
     Just (AnId id)            -> Variable
     Just (AConLike id) | isop -> DataCtorOperator
@@ -159,6 +210,9 @@ classifyName n = lookupName n >>= return . \case
     Nothing                   -> Variable
   where isop = GHC.isSymOcc (GHC.getOccName n) 
 
+-- | Checks if a given name is a valid module name
+validModuleName :: String -> Bool
+validModuleName s = all (nameValid Ctor) (splitOn "." s) 
 
 -- | Check if a given name is valid for a given kind of definition
 nameValid :: NameClass -> String -> Bool
